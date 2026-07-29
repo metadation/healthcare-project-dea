@@ -1,0 +1,508 @@
+import json
+import sys
+
+import boto3
+from botocore.exceptions import ClientError
+from awsglue.utils import getResolvedOptions
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+
+# ---------------------------------------------------------
+# Glue job parameters
+# ---------------------------------------------------------
+
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "JOB_NAME",
+        "SECRET_NAME",
+        "SCOPE",
+        "BUCKET_NAME",
+    ],
+)
+
+JOB_NAME = args["JOB_NAME"]
+SECRET_NAME = args["SECRET_NAME"]
+SCOPE = args["SCOPE"]
+BUCKET_NAME = args["BUCKET_NAME"]
+
+
+# ---------------------------------------------------------
+# Google Drive folder → S3 prefix configuration
+# ---------------------------------------------------------
+
+FOLDER_TO_S3_PREFIX = {
+    "1kz1zFk-NaNDCD0i9oQF6CF1w-1fzD4_m":
+        "SNF-VBP-Aggregate-Performance",
+
+    "1ryjUsDKZ3ww_suXhxqltJ1dfb_DxfIkZ":
+        "SNF-VBP-Facility-Performance",
+
+    "19E8-3pNPkjTJPorr0qnSGt3eClUjc5q2":
+        "NH-Citation-Descriptions",
+
+    "1hbtxT-8Y20iM6n9I70cYA35SfK_DbFr8":
+        "NH-Covid-Vax-Averages",
+
+    "1LgrCD_Nw3MYc5gKkR2RIL7SpYuA2d_6u":
+        "NH-Covid-Vax-Provider",
+
+    "1G8TUIDZYZfOwDffOlotqsFqUeZosxI0o":
+        "NH-Data-Collection-Intervakls",
+
+    "1N-MHfTg-OfCJF4TH39i7u1jvvkSofqLc":
+        "NH-Fire-Safety-Citations",
+
+    "1XdIpvajdjezMT6m_5f6oO-rk-DGf26Vo":
+        "NH-Health-Citations",
+
+    "1rNVFtdekWOB5h1w1OHgyf8dOzj20DdRq":
+        "NH-Health-Inspection-State",
+
+    "1Tc8n5WNKEDP2LH8Vf1iRgaAnm6d6CUph":
+        "NH-Ownership",
+
+    "1AErg2nxqO0f8MI03QzBPJT1oA_Va2orH":
+        "NH-Penalties",
+
+    "1Zfp2dn3-I5ZzeVtbAt3ALGQjmkjBSRxQ":
+        "NH-Provider-Info",
+
+    "1TF4dGM_QBniTO22TKtbGGGuVkgyrYBsv":
+        "NH-Quality-MSR-Cliams",
+
+    "1VzZCyKMuoexl1ExEIry70ZOsZVP5yy_t":
+        "NH-Quality-MSR-MDS",
+
+    "1oNAaXee6vSUZlwmBZci-2tGOrXLhFMHB":
+        "NH-State-US-Averages",
+
+    "1VvUR6SqcADHlXpvvVycuuX3FiTFOwJod":
+        "NH-Survey-Dates",
+
+    "1KsfrFdiQLiK55WP-NoIoeujgfMNV_Wyq":
+        "NH-Survey-Summary",
+
+    "1QP-NF0XZH7dKU4pGC5ZZq9PCsJtqYSSW":
+        "Skilled-Nursing-Facility-Quality-Reporting-Program---National-Data",
+
+    "1Z1tpO6G5a_F7an1xU7G7V1T8-QSeEezI":
+        "Skilled-Nursing-Facility-Quality-Reporting-Program---Provider-Data",
+
+    "1_kHp3YfIPJwHFP1vP5qC9dAqb6IsdCOw":
+        "Swing-Bed-SNF",
+
+    "1F65KvO2ayXeDy77hn7xKyZK3L0WdxvIR":
+        "Auxiliary-Data",
+
+    "1Ux8sUf6wdPU-XuL7OH0iIWqWJXPHczio":
+        "Daily-Nurse-Staffing",
+}
+
+
+CHECKPOINT_KEY = "_checkpoints/google-drive.json"
+
+
+# ---------------------------------------------------------
+# Reusable AWS clients
+# ---------------------------------------------------------
+
+secrets_client = boto3.client("secretsmanager")
+s3_client = boto3.client("s3")
+
+
+# ---------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------
+
+def read_checkpoint():
+    try:
+        response = s3_client.get_object(
+            Bucket=BUCKET_NAME,
+            Key=CHECKPOINT_KEY,
+        )
+
+        checkpoint = json.loads(
+            response["Body"].read()
+        )
+
+        return checkpoint["page_token"]
+
+    except ClientError as error:
+        error_code = error.response["Error"]["Code"]
+
+        if error_code in {
+            "NoSuchKey",
+            "404",
+            "NotFound",
+        }:
+            return None
+
+        raise
+
+
+def write_checkpoint(page_token):
+    checkpoint = {
+        "page_token": page_token,
+        "job_name": JOB_NAME,
+    }
+
+    s3_client.put_object(
+        Bucket=BUCKET_NAME,
+        Key=CHECKPOINT_KEY,
+        Body=json.dumps(checkpoint),
+        ContentType="application/json",
+    )
+
+
+# ---------------------------------------------------------
+# CSV encoding normalization
+# ---------------------------------------------------------
+
+def convert_csv_to_utf8(file_bytes):
+    """
+    Normalize CSV content to UTF-8.
+
+    Attempt UTF-8 first, including UTF-8 files containing
+    a byte-order mark. Fall back to Windows-1252.
+    """
+
+    try:
+        decoded_text = file_bytes.decode("utf-8-sig")
+        source_encoding = "utf-8"
+
+    except UnicodeDecodeError:
+        decoded_text = file_bytes.decode("cp1252")
+        source_encoding = "windows-1252"
+
+    return decoded_text.encode("utf-8"), source_encoding
+
+
+# ---------------------------------------------------------
+# Google Drive client
+# ---------------------------------------------------------
+
+def create_google_drive_client():
+    secret_response = secrets_client.get_secret_value(
+        SecretId=SECRET_NAME
+    )
+
+    google_api_credentials = json.loads(
+        secret_response["SecretString"]
+    )
+
+    credentials = Credentials(
+        token=None,
+        refresh_token=google_api_credentials[
+            "refresh_token"
+        ],
+        token_uri=google_api_credentials[
+            "token_uri"
+        ],
+        client_id=google_api_credentials[
+            "client_id"
+        ],
+        client_secret=google_api_credentials[
+            "client_secret"
+        ],
+        scopes=[SCOPE],
+    )
+
+    return build(
+        "drive",
+        "v3",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+
+# ---------------------------------------------------------
+# Google Drive file listing
+# ---------------------------------------------------------
+
+def list_csv_files(
+    google_client,
+    folder_id,
+):
+    """
+    List every CSV directly contained in a Drive folder.
+
+    Pagination is included so folders containing more than
+    1,000 files are processed correctly.
+    """
+
+    next_page_token = None
+
+    while True:
+        response = (
+            google_client
+            .files()
+            .list(
+                q=(
+                    f"'{folder_id}' in parents "
+                    "and trashed = false "
+                    "and mimeType = 'text/csv'"
+                ),
+                fields=(
+                    "nextPageToken,"
+                    "files(id,name,mimeType)"
+                ),
+                pageSize=1000,
+                pageToken=next_page_token,
+            )
+            .execute()
+        )
+
+        for file_metadata in response.get(
+            "files",
+            [],
+        ):
+            yield file_metadata
+
+        next_page_token = response.get(
+            "nextPageToken"
+        )
+
+        if not next_page_token:
+            break
+
+
+# ---------------------------------------------------------
+# Google Drive incremental-change processing
+# ---------------------------------------------------------
+
+def get_changed_file_ids(
+    google_client,
+    checkpoint_token,
+):
+    changed_file_ids = set()
+    next_page_token = checkpoint_token
+    new_checkpoint = None
+
+    while next_page_token:
+        response = (
+            google_client
+            .changes()
+            .list(
+                pageToken=next_page_token,
+                includeRemoved=True,
+                pageSize=1000,
+                fields=(
+                    "nextPageToken,"
+                    "newStartPageToken,"
+                    "changes(fileId,removed)"
+                ),
+            )
+            .execute()
+        )
+
+        for change in response.get(
+            "changes",
+            [],
+        ):
+            if not change.get(
+                "removed",
+                False,
+            ):
+                changed_file_ids.add(
+                    change["fileId"]
+                )
+
+        if response.get("nextPageToken"):
+            next_page_token = response[
+                "nextPageToken"
+            ]
+
+        else:
+            new_checkpoint = response.get(
+                "newStartPageToken"
+            )
+            break
+
+    if not new_checkpoint:
+        raise RuntimeError(
+            "Google Drive did not return "
+            "newStartPageToken."
+        )
+
+    return changed_file_ids, new_checkpoint
+
+
+# ---------------------------------------------------------
+# Download and upload one file
+# ---------------------------------------------------------
+
+def ingest_file(
+    google_client,
+    file_metadata,
+    s3_folder_name,
+):
+    file_id = file_metadata["id"]
+    file_name = file_metadata["name"]
+
+    file_bytes = (
+        google_client
+        .files()
+        .get_media(fileId=file_id)
+        .execute()
+    )
+
+    file_bytes, source_encoding = (
+        convert_csv_to_utf8(file_bytes)
+    )
+
+    safe_file_name = file_name.replace(
+        "/",
+        "_",
+    )
+
+    target_prefix = (
+        f"{s3_folder_name.strip('/')}/"
+    )
+
+    s3_key = (
+        f"{target_prefix}"
+        f"{safe_file_name}"
+    )
+
+    s3_client.put_object(
+        Bucket=BUCKET_NAME,
+        Key=s3_key,
+        Body=file_bytes,
+        ContentType="text/csv; charset=utf-8",
+        Metadata={
+            "google-drive-file-id": file_id,
+            "source-encoding": source_encoding,
+        },
+    )
+
+    print(
+        f"Uploaded {file_name} from "
+        f"{source_encoding} to "
+        f"s3://{BUCKET_NAME}/{s3_key}"
+    )
+
+    return {
+        "file_id": file_id,
+        "file_name": file_name,
+        "s3_key": s3_key,
+        "source_encoding": source_encoding,
+    }
+
+
+# ---------------------------------------------------------
+# Main Glue job
+# ---------------------------------------------------------
+
+def main():
+    google_client = create_google_drive_client()
+
+    page_token = read_checkpoint()
+    initial_load = page_token is None
+
+    if initial_load:
+        start_token_response = (
+            google_client
+            .changes()
+            .getStartPageToken()
+            .execute()
+        )
+
+        # Capture the boundary before performing the full load.
+        # Save it only after every upload succeeds.
+        page_token = start_token_response[
+            "startPageToken"
+        ]
+
+        changed_file_ids = None
+        new_checkpoint = page_token
+
+        print(
+            f"Initial checkpoint captured: "
+            f"{page_token}"
+        )
+
+    else:
+        (
+            changed_file_ids,
+            new_checkpoint,
+        ) = get_changed_file_ids(
+            google_client,
+            page_token,
+        )
+
+        print(
+            f"Changed Drive file IDs found: "
+            f"{len(changed_file_ids)}"
+        )
+
+    uploaded_files = []
+
+    for (
+        folder_id,
+        s3_folder_name,
+    ) in FOLDER_TO_S3_PREFIX.items():
+
+        print(
+            f"Checking Drive folder {folder_id} "
+            f"for S3 prefix {s3_folder_name}/"
+        )
+
+        for file_metadata in list_csv_files(
+            google_client,
+            folder_id,
+        ):
+            file_id = file_metadata["id"]
+
+            # Initial load processes every CSV.
+            # Incremental runs process only changed files.
+            if (
+                not initial_load
+                and file_id not in changed_file_ids
+            ):
+                continue
+
+            uploaded_file = ingest_file(
+                google_client=google_client,
+                file_metadata=file_metadata,
+                s3_folder_name=s3_folder_name,
+            )
+
+            uploaded_files.append(
+                uploaded_file
+            )
+
+    # Advance the Drive checkpoint only after every
+    # download, conversion and S3 upload succeeds.
+    write_checkpoint(new_checkpoint)
+
+    print(
+        f"Checkpoint advanced to: "
+        f"{new_checkpoint}"
+    )
+
+    print(
+        json.dumps(
+            {
+                "job_name": JOB_NAME,
+                "load_type": (
+                    "initial"
+                    if initial_load
+                    else "incremental"
+                ),
+                "file_count": len(
+                    uploaded_files
+                ),
+                "uploaded_files": (
+                    uploaded_files
+                ),
+            },
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
+    
